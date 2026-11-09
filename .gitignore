@@ -1,0 +1,6 @@
+kbuild/
+linux/
+output/
+*.raw
+*.qcow2
+efivars.fd

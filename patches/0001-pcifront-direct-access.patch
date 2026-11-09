@@ -1,0 +1,32 @@
+From: kmorph bootc experiment <kmorph@example.invalid>
+Subject: [PATCH] multikernel: Set pcifront direct access before any bus is adopted
+
+mk_pcifront_host_fenced() returned early when mk_pcifront_buses was
+empty.  A backup has no PCI buses of its own at boot; the host's buses
+are described in /chosen/multikernel,pci-buses and are added lazily by
+mk_pcifront_host_bus() when a function is adopted.  On an arm64
+takeover the fence therefore left mk_pcifront_direct_access false, and
+every mk_pcifront_adopt_function() returned -EPERM.  No device moved:
+the successor lost its disk, network and console.
+
+Set the flag at the fence regardless; the buses and their ECAM windows
+are picked up as each function is adopted.
+
+Tested on an arm64 Fedora bootc guest under QEMU/KVM: all three virtio
+functions (block, net, serial) are adopted after the fence.
+
+diff --git a/kernel/multikernel/pcifront.c b/kernel/multikernel/pcifront.c
+--- a/kernel/multikernel/pcifront.c
++++ b/kernel/multikernel/pcifront.c
+@@ -147,8 +147,7 @@ void mk_pcifront_host_fenced(void)
+ 	struct mk_pcifront_bus *fb;
+ 	bool direct = false;
+ 
+-	if (READ_ONCE(mk_pcifront_direct_access) ||
+-	    list_empty(&mk_pcifront_buses))
++	if (READ_ONCE(mk_pcifront_direct_access))
+ 		return;
+ 	WRITE_ONCE(mk_pcifront_direct_access, true);
+ 
+-- 
+2.47.0

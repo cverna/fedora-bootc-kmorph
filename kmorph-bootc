@@ -1,0 +1,273 @@
+#!/bin/bash
+# kmorph-bootc - run kmorph against a bootc deployment.
+#
+# bootc keeps the kernel and initramfs inside the deployment and stages
+# updates as separate deployment roots. This wrapper derives the
+# successor's kernel, initramfs and command line from the booted
+# (default) or staged deployment, merges them with the machine keys in
+# /etc/kmorph/kmorph.conf, and invokes kmorph.
+#
+#   kmorph-bootc generate [--staged]   write /run/kmorph/mk.conf
+#   kmorph-bootc arm      [--staged]   generate, then kmorph arm
+#   kmorph-bootc upgrade  [--staged]   generate, then kmorph upgrade
+#   kmorph-bootc run      [--staged]   generate, arm, then kmorph watch
+#
+# --staged arms the successor from the staged deployment instead of the
+# booted one. That is the live-update experiment: the successor boots the
+# staged deployment's root at the takeover.
+set -euo pipefail
+
+MACHINE_CONF=${KMORPH_CONF:-/etc/kmorph/kmorph.conf}
+RUNTIME_CONF=${KMORPH_RUNTIME_CONF:-/run/kmorph/mk.conf}
+BOOTC=${BOOTC:-bootc}
+# Overridable so the script can be tested without a real deployment.
+BOOT_DIR=${KMORPH_BOOT_DIR:-/boot}
+PROC_CMDLINE=${KMORPH_PROC_CMDLINE:-/proc/cmdline}
+OSTREE_ROOT=${KMORPH_OSTREE_ROOT:-/ostree}
+COMPOSEFS_STAGED=${KMORPH_COMPOSEFS_STAGED:-/run/composefs/staged-deployment}
+BOOTED_ROOT=${KMORPH_BOOTED_ROOT:-}
+
+die() { printf 'kmorph-bootc: %s\n' "$*" >&2; exit 1; }
+note() { printf 'kmorph-bootc: %s\n' "$*" >&2; }
+
+usage() {
+	sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+	exit 2
+}
+
+[ -r "$MACHINE_CONF" ] || die "$MACHINE_CONF not found"
+command -v "$BOOTC" >/dev/null || die "$BOOTC not found"
+
+case "${1:-}" in
+generate|arm|upgrade|run) cmd=$1 ;;
+*) usage ;;
+esac
+shift
+
+mode=booted
+if [ "${1:-}" = --staged ]; then
+	mode=staged
+	shift
+fi
+[ $# -eq 0 ] || usage
+
+status_json() { "$BOOTC" status --json --format-version=1; }
+
+# Print the deployment root, without a trailing slash. Empty means "/".
+deployment_root() {
+	local json staged root
+
+	if [ "$mode" = booted ]; then
+		printf '%s\n' "$BOOTED_ROOT"
+		return 0
+	fi
+
+	json=$(status_json)
+	staged=$(jq -c '.status.staged // empty' <<<"$json")
+	if [ -z "$staged" ]; then
+		# finalize-staged moves the deployment from staged to the queued
+		# rollback (bootc switches the boot order).
+		if jq -e '.status.rollbackQueued == true and .status.rollback != null' >/dev/null <<<"$json"; then
+			staged=$(jq -c '.status.rollback' <<<"$json")
+		fi
+	fi
+	[ -n "$staged" ] ||
+		die "no staged or queued rollback deployment; run bootc switch/upgrade and finalize-staged first"
+
+	root=$(jq -r --arg ostree "$OSTREE_ROOT" --arg composefs "$COMPOSEFS_STAGED" \
+		'if .ostree then
+			"\($ostree)/deploy/\(.ostree.stateroot)/deploy/\(.ostree.checksum).\(.ostree.deploySerial)"
+		elif .composefs then
+			$composefs
+		else empty end' <<<"$staged")
+	[ -n "$root" ] || die "cannot determine the staged deployment root"
+	[ -d "$root" ] || die "staged deployment root $root is not present"
+
+	printf '%s\n' "${root%/}"
+}
+
+deployment_kernel() {
+	local root=$1 kvers name
+
+	mapfile -t kvers < <(ls -1 "$root/usr/lib/modules" 2>/dev/null || true)
+	[ "${#kvers[@]}" -eq 1 ] ||
+		die "$root/usr/lib/modules must hold exactly one kernel"
+
+	for name in vmlinuz Image; do
+		if [ -f "$root/usr/lib/modules/${kvers[0]}/$name" ]; then
+			printf '%s\n' "$root/usr/lib/modules/${kvers[0]}/$name"
+			return 0
+		fi
+	done
+	die "$root/usr/lib/modules/${kvers[0]}/vmlinuz not found (UKI images are not supported)"
+}
+
+deployment_initrd() {
+	local image=$1/usr/lib/kmorph/successor.img
+
+	[ -f "$image" ] ||
+		die "$image not found; build the successor image into the container image"
+	printf '%s\n' "$image"
+}
+
+# True if the entry's options name the deployment the machine booted.
+# Used to avoid picking the booted entry when a rebuild keeps the same
+# image version.
+is_booted_entry() {
+	local file=$1 word cmdline
+
+	cmdline=" $(cat "$PROC_CMDLINE") "
+	while read -r word; do
+		case "$word" in
+		ostree=*|composefs=*|composefs.digest=*)
+			case "$cmdline" in
+			*" $word "*) return 0 ;;
+			esac
+			;;
+		esac
+	done < <(sed -n 's/^options //p' "$file" | tr ' ' '\n')
+	return 1
+}
+
+# Find the BLS entry for a deployment. For an ostree root the entry is
+# the one whose ostree= argument names it, so a missing entry means the
+# staged deployment has not been finalized yet. composefs carries no
+# path, so match the image version, then the newest non-booted entry.
+bls_entry() {
+	local root=$1 version=$2 file word bp resolved
+
+	case "$root" in
+	"$OSTREE_ROOT"/deploy/*)
+		for file in "$BOOT_DIR"/loader/entries/*.conf; do
+			[ -e "$file" ] || continue
+			while read -r word; do
+				case "$word" in
+				ostree=*)
+					bp=${word#ostree=}
+					resolved=$(readlink -f "$bp" 2>/dev/null || true)
+					[ -n "$resolved" ] || continue
+					# The BLS ostree= checksum is the *boot* checksum;
+					# its /0 resolves to the deployment root.  Compare the
+					# deployment path, allowing the /sysroot prefix.
+					if [ "$resolved" = "$root" ] ||
+					   [ "${resolved#/sysroot}" = "$root" ] ||
+					   [ "${resolved##*/}" = "${root##*/}" ]; then
+						printf '%s\n' "$file"
+						return 0
+					fi
+					;;
+				esac
+			done < <(sed -n 's/^options //p' "$file" | tr ' ' '\n')
+		done
+		# Fallback for an ostree deployment: only entries with ostree=,
+		# never a composefs entry that happens to share the version.
+		for file in "$BOOT_DIR"/loader/entries/*.conf; do
+			[ -e "$file" ] || continue
+			is_booted_entry "$file" && continue
+			grep -qE '^options .*ostree=' "$file" || continue
+			[ -n "$version" ] && grep -qxF "version $version" "$file" || continue
+			printf '%s\n' "$file"
+			return 0
+		done
+		for file in $(ls -1t "$BOOT_DIR"/loader/entries/*.conf 2>/dev/null); do
+			[ -e "$file" ] || continue
+			is_booted_entry "$file" && continue
+			grep -qE '^options .*ostree=' "$file" || continue
+			printf '%s\n' "$file"
+			return 0
+		done
+		return 0
+		;;
+	esac
+
+	for file in "$BOOT_DIR"/loader/entries/*.conf; do
+		[ -e "$file" ] || continue
+		is_booted_entry "$file" && continue
+		if [ -n "$version" ] && grep -qxF "version $version" "$file"; then
+			printf '%s\n' "$file"
+			return 0
+		fi
+	done
+
+	for file in $(ls -1t "$BOOT_DIR"/loader/entries/*.conf 2>/dev/null); do
+		is_booted_entry "$file" && continue
+		printf '%s\n' "$file"
+		return 0
+	done
+	return 0
+}
+
+booted_cmdline() {
+	local word out=
+
+	for word in $(cat "$PROC_CMDLINE"); do
+		case "$word" in
+		BOOT_IMAGE=*|initrd=*) continue ;;
+		esac
+		out="$out $word"
+	done
+	printf '%s\n' "${out# }"
+}
+
+staged_cmdline() {
+	local root=$1 version entry
+
+	version=$(status_json | jq -r '(.status.staged? // .status.rollback) | .image?.version // empty')
+	entry=$(bls_entry "$root" "$version")
+	[ -n "$entry" ] ||
+		die "no BLS entry for the staged deployment; run ostree admin finalize-staged first"
+	printf '%s\n' "$(sed -n 's/^options //p' "$entry")"
+}
+
+generate() {
+	local root kernel initrd cmdline console
+
+	root=$(deployment_root)
+	kernel=$(deployment_kernel "$root")
+	initrd=$(deployment_initrd "$root")
+
+	if [ "$mode" = staged ]; then
+		cmdline=$(staged_cmdline "$root")
+	else
+		cmdline=$(booted_cmdline)
+	fi
+	[ -n "$cmdline" ] || die "empty command line for the $mode deployment"
+
+	console=$(sed -n 's/^console[[:space:]]*=[[:space:]]*//p' "$MACHINE_CONF" | tail -1)
+	if [ -n "$console" ]; then
+		case " $cmdline " in
+		*" earlyprintk="*) ;;
+		*) cmdline="$cmdline earlyprintk=serial,$console,115200 keep_bootcon" ;;
+		esac
+	fi
+
+	mkdir -p "$(dirname "$RUNTIME_CONF")"
+	{
+		grep -v -E '^[[:space:]]*(kernel|initrd|cmdline)[[:space:]]*=' "$MACHINE_CONF"
+		printf 'kernel = %s\n' "$kernel"
+		printf 'initrd = %s\n' "$initrd"
+		printf 'cmdline = %s\n' "$cmdline"
+	} >"$RUNTIME_CONF"
+
+	note "$mode deployment: $kernel"
+	note "wrote $RUNTIME_CONF"
+}
+
+case "$cmd" in
+generate)
+	generate
+	;;
+arm)
+	generate
+	exec kmorph arm --config "$RUNTIME_CONF"
+	;;
+upgrade)
+	generate
+	exec kmorph upgrade --config "$RUNTIME_CONF"
+	;;
+run)
+	generate
+	kmorph arm --config "$RUNTIME_CONF"
+	exec kmorph watch --config "$RUNTIME_CONF"
+	;;
+esac
